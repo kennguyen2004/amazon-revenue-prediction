@@ -1,0 +1,614 @@
+---
+title: "Report - Kaggle Regression"
+author: "Khiem Nguyen"
+date: "`r format(Sys.Date(), '%D')`"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: '4'
+  html_document:
+    toc: true
+    toc_depth: 4
+    toc_float: true
+    code_folding: show
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.crop = FALSE)
+knitr::opts_chunk$set(fig.retina = 1, dev = "pdf", fig.crop = FALSE)
+```
+
+## Introduction
+
+In this study, we are trying to predict the log of the total revenue from Amazon orders in each state, given a month and year. Based on background knowledge, we believe several given factors are likely to be associated with the response variable, ‘log_total’. The month of each observation may be related to its ‘log_total’, since seasons, including summer and the holidays, would expectably cause an increase in orders. ‘count’ should also be associated with ‘log_total’, since more customers generally translate to higher total revenues. The customer income variable would also be a factor in determining ‘log_total’, since households with higher disposable incomes can spend more on their Amazon purchases. Additional predictors may include ‘age’, as well as ‘household size’ and ‘gender’.
+
+
+## Exploratory Data Analysis
+
+```{r, include=FALSE}
+library(knitr)
+library(tidyverse)
+library(tidymodels)
+library(readr)
+library(gt)
+library(webshot)
+library(webshot2)
+
+# ---------- Load data (RELATIVE paths only) ----------
+train <- read_csv("train.csv")
+test  <- read_csv("test.csv")
+
+orders <- read_csv("amazon_order_details_train.csv")
+cust   <- read_csv("customer_info_train.csv")
+
+# ---------- Clean column names (replaces spaces with underscores) ----------
+names(orders) <- names(orders) %>% tolower() %>% str_replace_all(" ", "_")
+names(cust)   <- names(cust)   %>% tolower() %>% str_replace_all(" ", "_")
+
+# ---------- Basic feature engineering (no lubridate) ----------
+orders <- orders %>%
+  mutate(
+    revenue    = item_cost * quantity,
+    order_date = as.Date(order_date),
+    ym         = as.Date(cut(order_date, "month")),     # month-floor
+    year       = as.integer(format(order_date, "%Y")),
+    month      = as.integer(format(order_date, "%m"))
+  )
+
+# ---------- Join orders with customer demographics ----------
+ord_demo <- orders %>%
+  left_join(
+    cust %>% select(
+      survey_response_id,
+      q_demos_state, q_demos_age, q_demos_income, q_demos_gender,
+      q_amazon_use_how_oft, q_amazon_use_hh_size, q_amazon_use_howmany
+    ),
+    by = "survey_response_id"
+  )
+
+# Helper: save function
+save_plot <- function(p, fname, w = 9, h = 6, dpi = 300) {
+  ggsave(filename = file.path("figs", fname), plot = p, width = w, height = h, dpi = dpi)
+}
+```
+### *1) Monthly Revenue Over Time*
+```{r, include=FALSE}
+# 1) Monthly revenue over time
+p1 <- ord_demo %>%
+  group_by(ym) %>%
+  summarise(monthly_revenue = sum(revenue, na.rm = TRUE), .groups = "drop") %>%
+  ggplot(aes(ym, monthly_revenue)) +
+  geom_line() +
+  labs(title = "Monthly Revenue Over Time", x = NULL, y = "Revenue (In Dollar Amounts)")
+save_plot(p1, "01_monthly_revenue_over_time.png")
+```
+```{r, out.width="0.6\\textwidth", fig.align="center"}
+knitr::include_graphics("figs/01_monthly_revenue_over_time.png")
+```
+Monthly revenue gradually rose from 2018 to 2022, with clear seasonal spikes late each year and temporary dips following the holiday seasons. The upward trend possibly reflects growth in customers and order volumes, while the recurring peaks show the trends of seasonality. 
+**Prediction model should show an upward trend in revenue over time, with peaks during the holidays followed by troughs.**
+
+*This plot does not account for higher-priced items or general inflation.
+
+### *2) Distribution of log10(Monthly Revenue)*
+```{r, include=FALSE}
+# 2) Distribution of log10 monthly revenue
+# compute bin width for scaling
+p2 <- ord_demo %>%
+  group_by(ym) %>%
+  summarise(monthly_revenue = sum(revenue, na.rm = TRUE), .groups = "drop") %>%
+  mutate(log_monthly_rev = log10(monthly_revenue)) %>%
+  ggplot(aes(log_monthly_rev)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white") +
+  labs(title = "Distribution of log10(Monthly Revenue)", x = "log10(Monthly Revenue)", y = "Number of months") +
+  geom_density(color = "red", size = 1, adjust = 1) +
+  scale_y_continuous(name = "Number of months") +
+  geom_rug(alpha = 0.2) +
+  guides(fill = "none")
+save_plot(p2, "02_distribution_of_log10.png")
+```
+```{r, out.width="0.6\\textwidth", fig.align="center"}
+knitr::include_graphics("figs/02_distribution_of_log10.png")
+```
+Monthly revenue (log10) clusters between 5.6 and 5.8, with a secondary mass around 5.4 and 5.5. The log transformation reduces skewness and makes visible the seasonal highs versus off-peak months. **Modeling should allow for seasonal effects instead of assuming a single average month.**
+
+### *3a) Top 15 States by Total Revenue*
+```{r, include=FALSE}
+# 3) Top 15 states by total revenue
+state_rev <- ord_demo %>%
+  group_by(q_demos_state) %>%
+  summarise(revenue = sum(revenue, na.rm = TRUE), .groups = "drop") %>%
+  slice_max(revenue, n = 15)
+p3 <- state_rev %>%
+  ggplot(aes(reorder(q_demos_state, revenue), revenue)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "Top 15 States by Total Revenue", x = "State", y = "Revenue")
+save_plot(p3, "03_top_15_states_by_total_revenue.png")
+```
+```{r, out.width="0.6\\textwidth", fig.align="center"}
+knitr::include_graphics("figs/03_top_15_states_by_total_revenue.png")
+```
+This graph simply shows the geographic concentration of spending and confirms the state-level imbalance, but doesn’t suggest new predictive power beyond that factor.
+
+### *3b) Top 15 States by Revenue per Customer*
+```{r, include=FALSE}
+# 12) Top 15 states: revenue per customer (to complement #3)
+state_rev_pc <- ord_demo %>%
+  group_by(q_demos_state) %>%
+  summarise(total_rev = sum(revenue, na.rm = TRUE),
+            customers = n_distinct(survey_response_id),
+            .groups = "drop") %>%
+  mutate(rev_per_customer = total_rev / pmax(customers, 1L)) %>%
+  slice_max(rev_per_customer, n = 15)
+p12 <- state_rev_pc %>%
+  ggplot(aes(reorder(q_demos_state, rev_per_customer), rev_per_customer)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "Top 15 States by Revenue per Customer", x = "State", y = "Revenue per customer")
+save_plot(p12, "04_top_15_states_by_revenue_per_customer.png")
+```
+```{r, out.width="0.6\\textwidth", fig.align="center"}
+knitr::include_graphics("figs/04_top_15_states_by_revenue_per_customer.png")
+```
+This one complements the graph above. Smaller states like Mississippi, West Virginia, and Delaware show the highest revenue generated for each customer. **Random Forests/XGB can split on state to learn “all else equal, Mississippi is more active than California."**
+
+### *4a) Revenue per Customer by Age*
+```{r, include=FALSE}
+# 4) Revenue per customer by age
+age_rev <- ord_demo %>%
+  group_by(q_demos_age) %>%
+  summarise(total_rev = sum(revenue, na.rm = TRUE),
+            customers = n_distinct(survey_response_id),
+            .groups = "drop") %>%
+  mutate(rev_per_customer = total_rev / customers)
+p4 <- age_rev %>%
+  ggplot(aes(reorder(q_demos_age, rev_per_customer), rev_per_customer)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "Revenue per Customer by Age Band", x = "Age Band", y = "Revenue per Customer (in Dollar Amounts)")
+save_plot(p4, "05_revenue_per_customer_by_age_band.png")
+```
+```{r, out.width="0.6\\textwidth", fig.align="center"}
+knitr::include_graphics("figs/05_revenue_per_customer_by_age_band.png")
+```
+Customers aged 35-44 spend the most on average, followed closely by 55-64 and 45-54. This suggests that spending peaks in mid-life stages. **Including these factors in our model will let it learn how customer age bands affect revenue. Tree models do especially better than linear models in capturing this curved trend.**
+
+### *4b) Revenue per Customer by Income Bracket*
+```{r, include=FALSE}
+# 4b) Revenue per customer by income
+income_rev <- ord_demo %>%
+  group_by(q_demos_income) %>%
+  summarise(total_rev = sum(revenue, na.rm = TRUE),
+            customers = n_distinct(survey_response_id),
+            .groups = "drop") %>%
+  mutate(rev_per_customer = total_rev / customers)
+p5 <- income_rev %>%
+  ggplot(aes(reorder(q_demos_income, rev_per_customer), rev_per_customer)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "Revenue per Customer by Income Bracket", x = "Income bracket", y = "Revenue per Customer (in Dollar Amount)")
+save_plot(p5, "06_revenue_per_customer_by_income_bracket.png")
+```
+```{r, out.width="0.6\\textwidth", fig.align="center"}
+knitr::include_graphics("figs/06_revenue_per_customer_by_income_bracket.png")
+```
+Higher-income groups, $100k-149k and $150k+, spend substantially more per customer than lower-income and “prefer not to say” groups. **The positive linear relationship between income groups and revenue per customer should be reflected in predictions. We should also keep in mind that income effects are strong but may interact with other demographics (e.g., high-income young vs. older households).**
+
+### *4c) Revenue per Customer by Age x Income*
+```{r, include=FALSE}
+# 4c) Revenue per customer by age x income
+# revenue per customer by age × income
+age_income_rev <- ord_demo %>%
+  group_by(q_demos_age, q_demos_income) %>%
+  summarise(
+    total_rev = sum(revenue, na.rm = TRUE),
+    customers = n_distinct(survey_response_id),
+    .groups = "drop"
+  ) %>%
+  mutate(rev_per_customer = total_rev / customers)
+
+# plot: grouped bar
+p_interaction <- ggplot(age_income_rev,
+                        aes(x = q_demos_income,
+                            y = rev_per_customer,
+                            fill = q_demos_age)) +
+  geom_col(position = "dodge") +
+  labs(title = "Revenue per Customer by Age x Income",
+       x = "Income Bracket",
+       y = "Revenue per Customer",
+       fill = "Age Band") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+save_plot(p_interaction, "07_revenue_per_customer_by_age_x_income.png")
+```
+```{r, out.width="0.6\\textwidth", fig.align="center"}
+knitr::include_graphics("figs/07_revenue_per_customer_by_age_x_income.png")
+```
+The revenue per customer rises with income across all ages. However, the differences in revenue per customer between age groups grow wider at higher income brackets; the widening gaps confirm that age and income interact. **Tree-based methods like Random Forests can capture the interaction because they learn conditional splits automatically.**
+
+### *5) Revenue per Customer by Gender*
+```{r, include=FALSE}
+# 5) Revenue p[er customer split by gender
+gender_rev <- ord_demo %>%
+  group_by(q_demos_gender) %>%
+  summarise(
+    total_rev = sum(revenue, na.rm = TRUE),
+    customers = n_distinct(survey_response_id),
+    .groups = "drop"
+  ) %>%
+  mutate(rev_per_customer = total_rev / customers)
+
+p6 <- ggplot(gender_rev, aes(q_demos_gender, rev_per_customer, fill = q_demos_gender)) +
+  geom_col(show.legend = FALSE) +
+  labs(title = "Revenue per Customer by Gender", x = "Gender", y = "Revenue per Customer")
+
+save_plot(p6, "08_revenue_per_customer_by_gender.png")
+```
+```{r, out.width="0.6\\textwidth", fig.align="center"}
+knitr::include_graphics("figs/08_revenue_per_customer_by_gender.png")
+```
+Female customers spend the most per person, follow by males. **A Random Forest or XGB model can naturally learn that a higher share of females at an observation predicts higher log revenue. Splitting the training set on count_female / count will capture the per-customer spending pattern effectively.**
+
+### *6 ) Revenue per Customer by Order Frequency*
+```{r, include=FALSE}
+# 6) Revenue by self-reported order frequency
+freq_rev <- ord_demo %>%
+  group_by(q_amazon_use_how_oft) %>%
+  summarise(revenue = sum(revenue, na.rm = TRUE), .groups = "drop")
+p7 <- freq_rev %>%
+  ggplot(aes(reorder(q_amazon_use_how_oft, revenue), revenue)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "Revenue by Self-Reported Order Frequency", x = "Frequency", y = "Revenue")
+save_plot(p7, "09_revenue_by_self_reported_order_frequency.png")
+```
+```{r, out.width="0.6\\textwidth", fig.align="center"}
+knitr::include_graphics("figs/09_revenue_by_self_reported_order_frequency.png")
+```
+This one is self-explanatory. It simply confirms that order frequency reflects the intensity of spend. **Tree models will learn that higher shares of high-frequency users at an observation boost log_total. **
+
+### *7a) Top 20 Categories by Revenue*
+```{r, include=FALSE}
+# 7a) Top 20 categories by revenue
+cat_rev <- ord_demo %>%
+  group_by(category) %>%
+  summarise(revenue = sum(revenue, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(revenue)) %>%
+  slice_head(n = 20)
+p8 <- cat_rev %>%
+  ggplot(aes(reorder(category, revenue), revenue)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "Top 20 Categories by Revenue", x = "Category", y = "Revenue")
+save_plot(p8, "10_top_20_categories_by_revenue.png")
+```
+```{r, out.width="0.6\\textwidth", fig.align="center"}
+knitr::include_graphics("figs/10_top_20_categories_by_revenue.png")
+```
+Books, pet foods, and gift cards are the categories yielding the highest revenue by a big margin, compared to the other categories. **Product categories don’t appear directly in the training set, but it’s still gives context for the dataset.**
+
+### *7b) Top Categories by Age Band*
+```{r, include=FALSE}
+# 7b) Category x Age (top 10 categories) 
+top10_cats <- cat_rev %>% slice_head(n = 10) %>% pull(category) 
+cat_age <- ord_demo %>% filter(category %in% top10_cats) %>% group_by(category, q_demos_age) %>% summarise(revenue = sum(revenue, na.rm = TRUE), .groups = "drop") 
+p9 <- cat_age %>% ggplot(aes(category, revenue, fill = q_demos_age)) + geom_col(position = "dodge") + coord_flip() + labs(title = "Top Categories by Age Band", x = "Category", y = "Revenue", fill = "Age band") 
+save_plot(p9, "11_top_20_categories_by_age_band.png")
+```
+```{r, out.width="0.6\\textwidth", fig.align="center"}
+knitr::include_graphics("figs/11_top_20_categories_by_age_band.png")
+```
+Certain age groups skew towards certain categories. For example, books and gift cards show strong contributions from 25-44 year olds, while nutritional supplements are popular among older generations. **Again, this information adds context to the data and its trends, but it does not add predictive value.**
+
+
+### *7c) Category Share by Year*
+```{r, include=FALSE}
+# 7c) Category share by year (top 10 categories)
+cat_year <- ord_demo %>%
+  filter(category %in% top10_cats) %>%
+  group_by(year, category) %>%
+  summarise(revenue = sum(revenue, na.rm = TRUE), .groups = "drop") %>%
+  group_by(year) %>%
+  mutate(pct = ifelse(sum(revenue, na.rm = TRUE) > 0, revenue / sum(revenue, na.rm = TRUE), NA_real_)) %>%
+  ungroup()
+p10 <- cat_year %>%
+  ggplot(aes(factor(year), pct, fill = category)) +
+  geom_col() +
+  labs(title = "Category Share by Year (Top 10)", x = "Year", y = "Share")
+save_plot(p10, "12_category_share_by_year.png")
+```
+```{r, out.width="0.6\\textwidth", fig.align="center"}
+knitr::include_graphics("figs/12_category_share_by_year.png")
+```
+
+
+### *8) Revenue per Customer by Household Size*
+```{r, include=FALSE}
+# 8) Revenue by household size
+hh_rev <- ord_demo %>%
+  group_by(q_amazon_use_hh_size) %>%
+  summarise(
+    total_rev = sum(revenue, na.rm = TRUE),
+    customers = n_distinct(survey_response_id),
+    .groups = "drop"
+  ) %>%
+  mutate(rev_per_customer = total_rev / customers)
+
+p11 <- ggplot(hh_rev, aes(q_amazon_use_hh_size, rev_per_customer)) +
+  geom_col(fill = "steelblue") +
+  labs(title = "Revenue per Customer by Household Size",
+       x = "Household size",
+       y = "Revenue per Customer (in Dollar Amounts)")
+save_plot(p11, "13_revenue_per_customer_by_household_size.png")
+```
+```{r, out.width="0.6\\textwidth", fig.align="center"}
+knitr::include_graphics("figs/13_revenue_per_customer_by_household_size.png")
+```
+Customers in larger households spend the most per person, while single-person households spend the least. This suggests a predictable, positive linear relationship between household size and per-customer revenue. **A Random Forest or XGB model can split on household composition, and it may find that observations with a higher share or large households will yield higher log revenues.**
+
+
+### *9) Distribution of log_total (from training set)*
+```{r, include=FALSE}
+# 9) Distribution of target (log_total) from train.csv
+p13 <- ggplot(train, aes(log_total)) +
+  geom_histogram(bins = 30) +
+  labs(title = "Distribution of log_total (Train)", x = "log_total", y = "Count")
+save_plot(p13, "14_distribution_of_log_total.png")
+```
+```{r, out.width="0.6\\textwidth", fig.align="center"}
+knitr::include_graphics("figs/14_distribution_of_log_total.png")
+```
+The target variable, monthly log revenue at the state-month level, follows roughly a left-skewing, bell-shaped distribution. **Since this is the target that the models are trained to predict later, its distribution is important. Tree-based models thrive on well-behaved data like the one shown. For linear regression, the transformation is critical.**
+
+### *10) Spearman Correlation Heatmap (from training set)*
+```{r, include=FALSE}
+# 10) Correlation heatmap (numeric features in train.csv)
+num_train <- train %>% select(where(is.numeric))
+cor_mat <- suppressWarnings(cor(num_train, use = "pairwise.complete.obs", method = "spearman"))
+cor_df  <- as.data.frame(as.table(cor_mat))
+p14 <- ggplot(cor_df, aes(Var1, Var2, fill = Freq)) +
+  geom_tile() +
+  scale_fill_gradient2() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Spearman Correlation Heatmap (Train Numeric Features)", x = NULL, y = NULL, fill = "ρ")
+save_plot(p14, "15_spearman_correlation_heatmap.png")
+```
+```{r, out.width="0.6\\textwidth", fig.align="center"}
+knitr::include_graphics("figs/15_spearman_correlation_heatmap.png")
+```
+Many demographic subcounts are strongly correlated with one another; for example, “count-female” is highly correlated with count, and age groups move in opposite directions. **These correlations highlight the weaknesses of linear regression. Multicollinearity inflates coefficient variance, unless a good amount of transformations are performed. Tree-based models handle redundancy more effectively.**
+
+### *11) log_total by State (from training data)*
+```{r, include=FALSE}
+# 11) log_total by state (variability across states)
+# if state column exists under a different name, adjust below accordingly.
+state_col_name <- names(train)[str_detect(names(train), "state")]
+if (length(state_col_name) == 1) {
+  p15 <- ggplot(train, aes(.data[[state_col_name]], log_total)) +
+    geom_boxplot(outlier.alpha = 0.3) +
+    coord_flip() +
+    labs(title = "log_total by State (Train)", x = "State", y = "log_total")
+}
+save_plot(p15, "16_log_total_by_state.png")
+```
+```{r, out.width="0.6\\textwidth", fig.align="center"}
+knitr::include_graphics("figs/16_log_total_by_state.png")
+```
+Revenue levels vary a lot across states. Larger states like California and New York show higher medians and larger spreads, compared to the smaller or less populous states. **Tree-based models can split on specific states and capture state-specific effects (when they outperform or underperform), after adjusting for demographics.**
+
+### *12) Selected feature vs log_total*
+```{r, include=FALSE}
+# 12) Selected feature vs log_total (scatter with smooth) — adjust features as present
+candidate_feats <- names(train)[str_detect(names(train), "^count_")][1:min(4, sum(str_detect(names(train), "^count_")))]
+if (length(candidate_feats) > 0) {
+  for (feat in candidate_feats) {
+    p_sc <- ggplot(train, aes(.data[[feat]], log_total)) +
+      geom_point(alpha = 0.25) +
+      geom_smooth(method = "loess", se = FALSE) +
+      labs(title = paste0("log_total vs ", feat), x = feat, y = "log_total")
+    save_plot(p_sc, "17_selected_feature_vs_log_total.png")
+  }
+}
+```
+```{r, out.width="0.6\\textwidth", fig.align="center"}
+knitr::include_graphics("figs/17_selected_feature_vs_log_total.png")
+```
+There is a clear nonlinear positive relationship. As the number of medium-frequency customers increases, total log revenue rises with diminishing returns. **This confirms that count_5to10 is a strong predictor of revenue. Tree-based models can capture thresholds, which makes count_5to10 especially valuable. **
+
+## Preprocessing / Recipes
+
+Our first stage of preprocessing variables is removing the order_totals variable because order_totals perfectly predicts log_total since it was calculated from it. For our linear model, first two random forest ranger engine models, and our XGB model, our only preprocessing step is to create a recipe that predicts log_total off of all other variables. For our random forest using linear regression model, our recipe dropped zero variance predictors, converted raw count variables into proportions based on count, stabilized the scaled proportions with a log transform of count, dropped raw counts after making ratios, and collapsed rare categories under a 1% threshold. 
+
+## Candidate Models
+
+Our first model is a simple linear model, which predicts log_total based on all other variables in the data. 
+
+Our second candidate model is a linear regression that includes interaction terms identified in the EDA. We suspected that age interacts with income and that household size also interacts with income. 
+
+Our third candidate model is a random forest model using the ranger engine. We set its arguments  to trees = 3000, mtry = 2, and min_n = 5. 
+
+Our fourth candidate model has the same mechanism as the second, but we changed the hyperparameter from 2 to 3 instead. This was to test if more randomized splits and smaller sample fractions would improve generalization. 
+
+Our fifth candidate model is a random forest using a linear regression engine. This model attempts to drop unimportant noise from the data, then scales the remaining predictors. We added the following specifications to our engine: “importance = "none", splitrule = "extratrees", replace = FALSE, and sample.fraction = 0.7”.
+
+Our sixth candidate model is a boosted trees model whose hyperparameters (tree_depth, learn_rate, mtry, min_n, and loss_reduction) are found during tuning. We set the trees during training to 500 to be lighter for cross-validation; while for our test data, we set it to 3000 for a heavier fit.
+```{r, include=FALSE}
+candidate_Models <- data.frame("Model Identifier" = c("Normal Linear Regresion", "Normal Linear Regression w/ Interaction Terms", "Random Forest 1", "Random Forest 2", "Random Forest (extratrees, sub-sampling)", "XGBoost Gradient Boosted Trees"),
+"Type of Model" = c("Linear Regression", "Linear Regression", "Random Forest", "Random Forest", "Random Forest", "Boosted Trees (regression)"),
+"Engine" = c("lm", "lm", "ranger", "ranger", "ranger", "xgboost"),
+"Recipe" = c("recipe(log_total ~ .)", 
+             "recipe(log.total ~ .) %>%
+step_dummy(all_nominal_predictors()) %>%
+step_interact(terms = ~ age x income + household_size x income) %>%
+step_zv(all_predictors())", 
+"recipe(log_total ~ .)", "recipe(log_total ~ .)", 
+"recipe(log_total ~ ., data = train) %>%
+  step_zv(all_predictors()) %>%
+  step_ratio(starts_with(\"count_\"), denom = denom_vars(count)) %>%
+  step_mutate(ln_count = log1p(count)) %>%
+  step_rm(starts_with(\"count_\")) %>%
+  step_other(all_nominal_predictors(), threshold = 0.01)", 
+  "recipe(log_total ~ .)"),
+"Hyperparameters" = c("N/A",
+                      "N/A",
+"trees = 3000,
+  mtry = 3,
+  min_n = 5", 
+"trees = 3000,
+  mtry = 2,
+  min_n = 5",
+"mtry  = tune(),
+  min_n = tune(),
+  trees = 500",
+"trees          = 500,       
+  tree_depth     = tune(),
+  learn_rate     = tune(),
+  mtry           = tune(),
+  min_n          = tune(),
+  loss_reduction = tune()"),
+stringsAsFactors = FALSE)
+
+model_table <- candidate_Models %>%
+  gt() %>%
+  tab_header(title = "Candidate Models") %>%
+  cols_align("center") %>%
+  tab_style(style = cell_text(weight = "bold"),
+            locations = cells_title(groups = "title"))
+gtsave(model_table, "model_table.png")
+```
+```{r}
+include_graphics("model_table.png")
+```
+
+\clearpage
+
+## Model Evaluation and Tuning
+
+All models were evaluated using 10-fold cross validation stratified on log_total, with a seed of 123. RMSE was used as the model evaluation metric. Hyperparameters were tuned for Model 4 (Random Forest with extratrees), and Model 5 (XGBoost) via racing ANOVA and grid search.
+```{r, include=FALSE}
+model_metrics <- data.frame("Model Identifier" = c("Normal Linear Regresion", "Normal Linear Regression w/ Interaction Terms", "Random Forest 1", "Random Forest 2", "Random Forest (extratrees, sub-sampling)", "XGBoost Gradient Boosted Trees"),
+                         "Metric Score" = c(0.1472681,
+0.125,
+0.1127591,
+0.1128492,
+0.1164627,
+0.1523278),
+"SE of Metric" = c(0.003194044,
+0.00211,
+0.002984036,
+0.002908474,
+0.002987771,
+0.002759284
+)
+,
+stringsAsFactors = FALSE)
+
+model_eval <- model_metrics %>% gt() %>% 
+  tab_header(title = "Model Evaluation") %>% 
+  cols_align(align = "center") %>% 
+  tab_style(style = cell_text(weight = "bold"), locations = cells_title(groups = "title"))
+```
+```{r, include=FALSE}
+metrics_tbl <- tribble(
+  ~model,                                   ~rmse,       ~se,
+  "Random Forest 1",                         0.1127591,   0.002984036,
+  "Random Forest 2",                         0.1128492,   0.002908474,
+  "Random Forest (extratrees, sub-sampling)",0.1164627,   0.002987771,
+  "Normal Linear Regression",                0.1472681,   0.003194044,
+  "XGB",                                     0.1523278,   0.002759284
+) %>%
+  mutate(mse = rmse^2)
+
+model_comparison <- ggplot(metrics_tbl %>% arrange(rmse),
+       aes(x = reorder(model, rmse), y = rmse)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = rmse - se, ymax = rmse + se), width = 0.18, color = "red") +
+  coord_flip() +
+  labs(
+    title = "Model Comparison (10-fold CV): RMSE",
+    x = NULL,
+    y = "RMSE (mean +- SE)"
+  ) +
+  theme_minimal(base_size = 12)
+
+```
+```{r}
+model_comparison
+
+model_eval
+```
+Based on the results of the RMSE metric scores, we can make many observations and comparisons of the five models. First, Model 2 and Model 3 achieved the lowest RMSE and outperformed all other models. Model 4 showed no improvement relative to the simpler Random Forest models. Model 1 (Linear Regression) underfit the data, with a higher RMSE of 0.147. Finally, Model 5 (XGBoost) underperformed despite the hyperparameter tuning.
+
+
+## Discussion of Final Model
+The runner-up was Model 3, Random Forest 2 with mtry set to 3. The results suggest that Random Forest is well-suited to capture the non-linearities and complex interactions present in the data, while still maintaining a strong generalization. The strengths of Model 2 include consistently producing the lowest RMSE among the candidate models and performing well with high-dimensional data and noisy predictors. 
+
+Generally, we can see that a strength of the Random Forest models was that they were generally stable across different mtry values. A drawback of Model 2 is the limited interpretability the model provides. Random Forest models do not give interpretable coefficients, making it difficult to estimate the effects of the individual predictors. Furthermore, the final model was computationally expensive and slow when compared to a simpler linear regression model. With this model, a key component to mitigate the risk of overfitting was carefully controlling the parameters and tuning. 
+
+While Random Forest already handles nonlinearities relatively well, engineering additional features, with information about the context of the data, could help the trees better learn. Creating ratios, log transformations, or interaction terms could potentially reduce RMSE even further. 
+
+## Appendix: Final Annotated Script
+
+```{r, eval=FALSE}
+library(rsample)
+
+set.seed(123)  # set a random seed
+
+# recipe, normalizing all numeric predictors
+rf_rec <- recipe(log_total ~., data = train) %>%
+  step_normalize(all_numeric_predictors())
+
+# defining random forest model
+rf_model <- rand_forest(
+  trees = 3000,  # should be sufficient
+  mtry = 2,
+  min_n = 5
+) %>%
+  set_engine("ranger") %>%
+  set_mode("regression")
+
+# recipe + model
+rf_wf <- workflow() %>%
+  add_model(rf_model) %>%
+  add_recipe(rf_rec)
+
+# stratify
+train_folds <- vfold_cv(train, v = 10, strata = log_total)
+
+# cross validation for evaluation
+rf_fit <- fit_resamples(
+  rf_wf,
+  resamples = train_folds,
+  metrics = metric_set(rmse)
+)
+
+# collect metrics from CV results
+metrics <- collect_metrics(rf_fit)
+
+# filter for rmse, then also calculate mse manually (just squaring mean rmse)
+metrics %>%
+  filter(.metric == "rmse") %>%
+  mutate(mse = mean^2)
+
+# fit the final model on the full training data
+rf_fit_final <- rf_wf %>%
+  fit(data = train)
+
+# make predictions on test set
+pred <- test %>%
+  select(id) %>%
+  bind_cols(
+    predict(rf_fit_final, new_data = test)
+  )
+
+# format predictions for submission (id + log_total)
+pred %>% 
+  rename(log_total = .pred) %>%
+  select(id, log_total) %>%
+  write_csv("rf_fit_final_pred_2.csv")
+```
+
+
+
